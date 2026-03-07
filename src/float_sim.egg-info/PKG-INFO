@@ -1,0 +1,52 @@
+Metadata-Version: 2.4
+Name: float-sim
+Version: 0.1.0
+Summary: Minimal event-based Monte Carlo simulation for floating body interactions.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.9
+Requires-Dist: numpy>=2.2
+Provides-Extra: notebook
+Requires-Dist: ipykernel>=6.29; extra == "notebook"
+Requires-Dist: jupyterlab>=4.4; extra == "notebook"
+
+# Floating Bodies Monte Carlo Prototype
+
+This repository contains a first reduced simulation prototype for a research question about whether two elongated floating bodies might experience a net inward tendency because wave events affect their outer sides differently from their inner sides.
+
+The implementation is intentionally minimal and falsifiable:
+
+- `notebooks/minimal_event_model.ipynb` is the main research notebook.
+- `src/float_sim/event_model.py` contains the typed simulation helpers used by the notebook.
+- `tests/test_event_model.py` contains lightweight checks for geometry, symmetry, and reproducibility.
+
+The model is a 2D top-view event-based Monte Carlo approximation. It is not a CFD model and should not be interpreted as one.
+
+## Setup with uv
+
+This project is configured as a `uv`-managed Python package using a `src/` layout.
+
+Create a project-local virtual environment:
+
+```bash
+uv venv .venv
+source .venv/bin/activate
+```
+
+Install runtime, test, and notebook dependencies into the active environment:
+
+```bash
+uv sync --active --group dev --extra notebook
+```
+
+Run the test suite:
+
+```bash
+pytest -q
+```
+
+Start JupyterLab for the notebook workflow:
+
+```bash
+jupyter lab
+```
