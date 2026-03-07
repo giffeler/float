@@ -7,6 +7,7 @@ import numpy as np
 
 SideName = Literal["outer", "inner"]
 SourceModel = Literal["uniform", "vertical_gradient"]
+ShieldingMode = Literal["none", "binary", "graded"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,54 @@ class SourceField:
             return "uniform"
         direction = "+y" if self.vertical_bias > 0.0 else "-y"
         return f"{self.model} ({direction}, |bias|={abs(self.vertical_bias):.2f})"
+
+
+@dataclass(frozen=True)
+class ShieldingModel:
+    mode: ShieldingMode = "binary"
+    minimum_transmission: float = 0.0
+    occlusion_decay_length: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"none", "binary", "graded"}:
+            raise ValueError(f"unsupported shielding mode: {self.mode}")
+        if not 0.0 <= self.minimum_transmission <= 1.0:
+            raise ValueError("minimum_transmission must lie in [0, 1]")
+        if self.occlusion_decay_length <= 0.0:
+            raise ValueError("occlusion_decay_length must be positive")
+
+    @classmethod
+    def none(cls) -> "ShieldingModel":
+        return cls(mode="none")
+
+    @classmethod
+    def binary(cls) -> "ShieldingModel":
+        return cls(mode="binary")
+
+    @classmethod
+    def graded(
+        cls,
+        *,
+        minimum_transmission: float = 0.15,
+        occlusion_decay_length: float = 0.25,
+    ) -> "ShieldingModel":
+        return cls(
+            mode="graded",
+            minimum_transmission=minimum_transmission,
+            occlusion_decay_length=occlusion_decay_length,
+        )
+
+    @property
+    def label(self) -> str:
+        if self.mode == "none":
+            return "no shielding"
+        if self.mode == "binary":
+            return "binary shielding"
+        return (
+            "graded shielding "
+            f"(min transmission = {self.minimum_transmission:.2f}, "
+            f"decay = {self.occlusion_decay_length:.2f})"
+        )
 
 
 @dataclass(frozen=True)
@@ -103,11 +152,13 @@ class BodyMetrics:
 class BatchResult:
     gap: float
     blocking_enabled: bool
+    shielding_mode: ShieldingMode
     upper: BodyMetrics
     lower: BodyMetrics
     bodies: tuple[Body, Body]
     events: WaveEvents
     source_field: SourceField
+    shielding_model: ShieldingModel
 
     @property
     def mean_gap_closing_force(self) -> float:
@@ -118,10 +169,13 @@ class BatchResult:
 class BatchDiagnostics:
     gap: float
     blocking_enabled: bool
+    shielding_mode: ShieldingMode
     seed: int
     n_events: int
     source_model: SourceModel
     source_bias: float
+    minimum_transmission: float
+    occlusion_decay_length: float
     mean_gap_closing_force: float
     system_net_force_y: float
     mean_abs_net_force_y: float
@@ -145,10 +199,13 @@ class BatchDiagnostics:
 class EnsembleSummary:
     gap: float
     blocking_enabled: bool
+    shielding_mode: ShieldingMode
     repeats: int
     n_events: int
     source_model: SourceModel
     source_bias: float
+    minimum_transmission: float
+    occlusion_decay_length: float
     mean_gap_closing_force: float
     std_gap_closing_force: float
     sem_gap_closing_force: float
@@ -242,6 +299,10 @@ def side_sample_points(body: Body, side: SideName, count: int) -> np.ndarray:
 
 
 def segment_intersects_body(start: np.ndarray, end: np.ndarray, body: Body) -> bool:
+    return segment_body_overlap_length(start, end, body) > 0.0
+
+
+def segment_body_overlap_length(start: np.ndarray, end: np.ndarray, body: Body) -> float:
     direction = end - start
     t_min = 0.0
     t_max = 1.0
@@ -251,7 +312,7 @@ def segment_intersects_body(start: np.ndarray, end: np.ndarray, body: Body) -> b
         delta = direction[axis]
         if abs(delta) < 1e-12:
             if start[axis] < lower or start[axis] > upper:
-                return False
+                return 0.0
             continue
 
         t1 = (lower - start[axis]) / delta
@@ -261,9 +322,41 @@ def segment_intersects_body(start: np.ndarray, end: np.ndarray, body: Body) -> b
         t_min = max(t_min, axis_min)
         t_max = min(t_max, axis_max)
         if t_min > t_max:
-            return False
+            return 0.0
 
-    return True
+    return float(np.linalg.norm(direction) * max(0.0, t_max - t_min))
+
+
+def resolve_shielding_model(
+    blocking_enabled: bool,
+    shielding_model: ShieldingModel | None,
+) -> ShieldingModel:
+    if shielding_model is not None:
+        return shielding_model
+    return ShieldingModel.binary() if blocking_enabled else ShieldingModel.none()
+
+
+def shielding_transmission(
+    start: np.ndarray,
+    end: np.ndarray,
+    blocker: Body | None,
+    shielding_model: ShieldingModel,
+) -> float:
+    if blocker is None or shielding_model.mode == "none":
+        return 1.0
+
+    overlap_length = segment_body_overlap_length(start, end, blocker)
+    if overlap_length <= 0.0:
+        return 1.0
+
+    if shielding_model.mode == "binary":
+        return 0.0
+
+    decay = shielding_model.occlusion_decay_length
+    return float(
+        shielding_model.minimum_transmission
+        + (1.0 - shielding_model.minimum_transmission) * np.exp(-overlap_length / decay)
+    )
 
 
 def sample_wave_events(
@@ -312,7 +405,9 @@ def evaluate_side_metrics(
     params: ModelParameters,
     blocker: Body | None,
     blocking_enabled: bool,
+    shielding_model: ShieldingModel | None = None,
 ) -> SideMetrics:
+    active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
     points = side_sample_points(body, side, params.side_samples)
     normal = body.side_normal(side)
     vectors = points[None, :, :] - events.positions[:, None, :]
@@ -321,15 +416,15 @@ def evaluate_side_metrics(
     incident = -np.einsum("epd,d->ep", unit_vectors, normal)
     local_impulse = events.amplitudes[:, None] * attenuation(distances, params) * np.maximum(incident, 0.0)
 
-    if blocking_enabled and blocker is not None:
-        blocked = np.array(
+    if active_shielding.mode != "none" and blocker is not None:
+        transmission = np.array(
             [
-                [segment_intersects_body(source, point, blocker) for point in points]
+                [shielding_transmission(source, point, blocker, active_shielding) for point in points]
                 for source in events.positions
             ],
-            dtype=bool,
+            dtype=float,
         )
-        local_impulse = np.where(blocked, 0.0, local_impulse)
+        local_impulse = transmission * local_impulse
 
     event_impulse = local_impulse.mean(axis=1)
     positive = event_impulse > 0.0
@@ -342,6 +437,7 @@ def compute_body_metrics(
     events: WaveEvents,
     params: ModelParameters,
     blocking_enabled: bool,
+    shielding_model: ShieldingModel | None = None,
 ) -> BodyMetrics:
     outer = evaluate_side_metrics(
         body=body,
@@ -350,6 +446,7 @@ def compute_body_metrics(
         params=params,
         blocker=blocker,
         blocking_enabled=blocking_enabled,
+        shielding_model=shielding_model,
     )
     inner = evaluate_side_metrics(
         body=body,
@@ -358,6 +455,7 @@ def compute_body_metrics(
         params=params,
         blocker=blocker,
         blocking_enabled=blocking_enabled,
+        shielding_model=shielding_model,
     )
 
     outer_force_y = -body.side_normal("outer")[1] * outer.cumulative_impulse
@@ -381,8 +479,10 @@ def simulate_batch(
     blocking_enabled: bool = True,
     events: WaveEvents | None = None,
     source_field: SourceField | None = None,
+    shielding_model: ShieldingModel | None = None,
 ) -> BatchResult:
     field = source_field or SourceField()
+    active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
     bodies = make_parallel_bodies(gap=gap, params=params)
     sampled_events = events if events is not None else sample_wave_events(rng, n_events, bodies, params, field)
     upper = compute_body_metrics(
@@ -390,23 +490,27 @@ def simulate_batch(
         blocker=bodies[1],
         events=sampled_events,
         params=params,
-        blocking_enabled=blocking_enabled,
+        blocking_enabled=active_shielding.mode != "none",
+        shielding_model=active_shielding,
     )
     lower = compute_body_metrics(
         body=bodies[1],
         blocker=bodies[0],
         events=sampled_events,
         params=params,
-        blocking_enabled=blocking_enabled,
+        blocking_enabled=active_shielding.mode != "none",
+        shielding_model=active_shielding,
     )
     return BatchResult(
         gap=gap,
-        blocking_enabled=blocking_enabled,
+        blocking_enabled=active_shielding.mode != "none",
+        shielding_mode=active_shielding.mode,
         upper=upper,
         lower=lower,
         bodies=bodies,
         events=sampled_events,
         source_field=field,
+        shielding_model=active_shielding,
     )
 
 
@@ -425,10 +529,13 @@ def summarize_batch(batch: BatchResult, seed: int, n_events: int) -> BatchDiagno
     return BatchDiagnostics(
         gap=batch.gap,
         blocking_enabled=batch.blocking_enabled,
+        shielding_mode=batch.shielding_model.mode,
         seed=seed,
         n_events=n_events,
         source_model=batch.source_field.model,
         source_bias=batch.source_field.vertical_bias,
+        minimum_transmission=batch.shielding_model.minimum_transmission,
+        occlusion_decay_length=batch.shielding_model.occlusion_decay_length,
         mean_gap_closing_force=batch.mean_gap_closing_force,
         system_net_force_y=float(system_net_force),
         mean_abs_net_force_y=float(mean_abs_net_force),
@@ -449,8 +556,10 @@ def run_ensemble(
     seed: int,
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
+    shielding_model: ShieldingModel | None = None,
 ) -> list[BatchDiagnostics]:
     field = source_field or SourceField()
+    active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
     diagnostics: list[BatchDiagnostics] = []
     for repeat in range(repeats):
         run_seed = seed + repeat
@@ -459,8 +568,9 @@ def run_ensemble(
             params=params,
             rng=np.random.default_rng(run_seed),
             n_events=n_events,
-            blocking_enabled=blocking_enabled,
+            blocking_enabled=active_shielding.mode != "none",
             source_field=field,
+            shielding_model=active_shielding,
         )
         diagnostics.append(summarize_batch(batch=batch, seed=run_seed, n_events=n_events))
     return diagnostics
@@ -489,10 +599,13 @@ def summarize_ensemble(records: Sequence[BatchDiagnostics]) -> EnsembleSummary:
     return EnsembleSummary(
         gap=first.gap,
         blocking_enabled=first.blocking_enabled,
+        shielding_mode=first.shielding_mode,
         repeats=repeats,
         n_events=first.n_events,
         source_model=first.source_model,
         source_bias=first.source_bias,
+        minimum_transmission=first.minimum_transmission,
+        occlusion_decay_length=first.occlusion_decay_length,
         mean_gap_closing_force=gap_closing_mean,
         std_gap_closing_force=gap_closing_std,
         sem_gap_closing_force=float(sem),
@@ -519,6 +632,7 @@ def run_gap_ensemble_sweep(
     seed: int,
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
+    shielding_model: ShieldingModel | None = None,
 ) -> list[EnsembleSummary]:
     summaries: list[EnsembleSummary] = []
     for gap in gaps:
@@ -530,6 +644,7 @@ def run_gap_ensemble_sweep(
             seed=seed,
             blocking_enabled=blocking_enabled,
             source_field=source_field,
+            shielding_model=shielding_model,
         )
         summaries.append(summarize_ensemble(records))
     return summaries
@@ -543,6 +658,7 @@ def run_distance_sweep(
     seed: int,
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
+    shielding_model: ShieldingModel | None = None,
 ) -> list[SweepPoint]:
     summaries = run_gap_ensemble_sweep(
         gaps=gaps,
@@ -552,6 +668,7 @@ def run_distance_sweep(
         seed=seed,
         blocking_enabled=blocking_enabled,
         source_field=source_field,
+        shielding_model=shielding_model,
     )
     return [
         SweepPoint(
@@ -572,6 +689,7 @@ def simulate_gap_trajectory(
     seed: int,
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
+    shielding_model: ShieldingModel | None = None,
 ) -> list[TrajectoryPoint]:
     rng = np.random.default_rng(seed)
     gap = float(initial_gap)
@@ -585,6 +703,7 @@ def simulate_gap_trajectory(
             n_events=n_events_per_step,
             blocking_enabled=blocking_enabled,
             source_field=source_field,
+            shielding_model=shielding_model,
         )
         gap = max(0.0, gap - params.mobility * batch.mean_gap_closing_force)
         trajectory.append(
@@ -618,7 +737,7 @@ def plot_geometry(ax, batch: BatchResult, max_events: int = 400) -> None:
 
     ax.axhline(0.0, color="0.65", linestyle="--", linewidth=1.0)
     ax.set_title(
-        f"Geometry and Sampled Wave Events ({batch.source_field.label}, gap = {batch.gap:.2f})"
+        f"Geometry and Sampled Wave Events ({batch.source_field.label}, {batch.shielding_model.label}, gap = {batch.gap:.2f})"
     )
     ax.set_xlabel("x position")
     ax.set_ylabel("y position")

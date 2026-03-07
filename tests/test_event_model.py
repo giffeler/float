@@ -5,6 +5,7 @@ import numpy as np
 from float_sim.event_model import (
     Body,
     ModelParameters,
+    ShieldingModel,
     SourceField,
     WaveEvents,
     event_count_from_source_density,
@@ -13,6 +14,7 @@ from float_sim.event_model import (
     point_in_body,
     run_ensemble,
     sample_wave_events,
+    segment_body_overlap_length,
     segment_intersects_body,
     simulate_batch,
     summarize_batch,
@@ -31,6 +33,8 @@ def test_segment_intersects_body_for_crossing_segment() -> None:
 
     assert segment_intersects_body(np.array([-2.0, 0.0]), np.array([2.0, 0.0]), body)
     assert not segment_intersects_body(np.array([-2.0, 2.0]), np.array([2.0, 2.0]), body)
+    assert np.isclose(segment_body_overlap_length(np.array([-2.0, 0.0]), np.array([2.0, 0.0]), body), 2.0)
+    assert np.isclose(segment_body_overlap_length(np.array([-2.0, 2.0]), np.array([2.0, 2.0]), body), 0.0)
 
 
 def test_mirrored_events_give_equal_inner_and_outer_impulse_without_blocker() -> None:
@@ -96,9 +100,19 @@ def test_blocking_only_removes_contributions() -> None:
         blocker=bodies[1],
         blocking_enabled=True,
     )
+    upper_graded = evaluate_side_metrics(
+        bodies[0],
+        "inner",
+        events,
+        params,
+        blocker=bodies[1],
+        blocking_enabled=True,
+        shielding_model=ShieldingModel.graded(minimum_transmission=0.2, occlusion_decay_length=0.2),
+    )
 
     assert upper_blocked.hits <= upper_free.hits
     assert upper_blocked.cumulative_impulse <= upper_free.cumulative_impulse
+    assert upper_blocked.cumulative_impulse <= upper_graded.cumulative_impulse <= upper_free.cumulative_impulse
 
 
 def test_simulation_is_reproducible_for_fixed_seed() -> None:
@@ -121,6 +135,29 @@ def test_simulation_is_reproducible_for_fixed_seed() -> None:
     assert np.isclose(batch_a.mean_gap_closing_force, batch_b.mean_gap_closing_force)
     assert np.allclose(batch_a.events.positions, batch_b.events.positions)
     assert np.allclose(batch_a.events.amplitudes, batch_b.events.amplitudes)
+
+
+def test_binary_shielding_model_matches_legacy_boolean_blocking() -> None:
+    params = ModelParameters()
+    batch_legacy = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(19),
+        n_events=250,
+        blocking_enabled=True,
+    )
+    batch_model = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(19),
+        n_events=250,
+        blocking_enabled=True,
+        shielding_model=ShieldingModel.binary(),
+    )
+
+    assert np.isclose(batch_legacy.mean_gap_closing_force, batch_model.mean_gap_closing_force)
+    assert np.isclose(batch_legacy.upper.inner.cumulative_impulse, batch_model.upper.inner.cumulative_impulse)
+    assert np.isclose(batch_legacy.lower.outer.cumulative_impulse, batch_model.lower.outer.cumulative_impulse)
 
 
 def test_source_density_to_event_count_scales_with_domain_area() -> None:
