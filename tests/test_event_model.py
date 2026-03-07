@@ -5,11 +5,17 @@ import numpy as np
 from float_sim.event_model import (
     Body,
     ModelParameters,
+    SourceField,
     WaveEvents,
+    event_count_from_source_density,
     evaluate_side_metrics,
     make_parallel_bodies,
+    point_in_body,
+    run_ensemble,
+    sample_wave_events,
     segment_intersects_body,
     simulate_batch,
+    summarize_batch,
 )
 
 
@@ -115,3 +121,102 @@ def test_simulation_is_reproducible_for_fixed_seed() -> None:
     assert np.isclose(batch_a.mean_gap_closing_force, batch_b.mean_gap_closing_force)
     assert np.allclose(batch_a.events.positions, batch_b.events.positions)
     assert np.allclose(batch_a.events.amplitudes, batch_b.events.amplitudes)
+
+
+def test_source_density_to_event_count_scales_with_domain_area() -> None:
+    density = 3.5
+    params_small = ModelParameters(domain_half_length=4.0, domain_half_width=3.0)
+    params_large = ModelParameters(domain_half_length=8.0, domain_half_width=3.0)
+
+    assert event_count_from_source_density(density, params_large) == 2 * event_count_from_source_density(
+        density, params_small
+    )
+
+
+def test_vertical_gradient_bias_shifts_sources_toward_positive_y() -> None:
+    params = ModelParameters(domain_half_length=6.0, domain_half_width=4.0)
+    bodies = make_parallel_bodies(gap=0.8, params=params)
+
+    unbiased = sample_wave_events(
+        rng=np.random.default_rng(12),
+        count=2500,
+        bodies=bodies,
+        params=params,
+        source_field=SourceField(),
+    )
+    biased = sample_wave_events(
+        rng=np.random.default_rng(12),
+        count=2500,
+        bodies=bodies,
+        params=params,
+        source_field=SourceField(model="vertical_gradient", vertical_bias=0.8),
+    )
+
+    assert biased.positions[:, 1].mean() > unbiased.positions[:, 1].mean() + 0.5
+    assert not any(
+        point_in_body(point, body, padding=params.source_padding)
+        for point in biased.positions
+        for body in bodies
+    )
+
+
+def test_run_ensemble_is_reproducible_for_fixed_seed_and_source_field() -> None:
+    params = ModelParameters()
+    source_field = SourceField(model="vertical_gradient", vertical_bias=0.6)
+    records_a = run_ensemble(
+        gap=0.6,
+        params=params,
+        n_events=200,
+        repeats=4,
+        seed=21,
+        blocking_enabled=True,
+        source_field=source_field,
+    )
+    records_b = run_ensemble(
+        gap=0.6,
+        params=params,
+        n_events=200,
+        repeats=4,
+        seed=21,
+        blocking_enabled=True,
+        source_field=source_field,
+    )
+
+    assert np.allclose(
+        [record.mean_gap_closing_force for record in records_a],
+        [record.mean_gap_closing_force for record in records_b],
+    )
+    assert np.allclose(
+        [record.mean_inner_impulse for record in records_a],
+        [record.mean_inner_impulse for record in records_b],
+    )
+
+
+def test_mirrored_configuration_has_zero_system_net_force_without_blocking() -> None:
+    params = ModelParameters(side_samples=9, attenuation_length=3.0)
+    events = WaveEvents(
+        positions=np.array(
+            [
+                [0.0, 2.0],
+                [0.0, -2.0],
+                [1.0, 2.3],
+                [1.0, -2.3],
+                [-1.4, 1.8],
+                [-1.4, -1.8],
+            ],
+            dtype=float,
+        ),
+        amplitudes=np.ones(6, dtype=float),
+    )
+
+    batch = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(3),
+        n_events=len(events),
+        blocking_enabled=False,
+        events=events,
+    )
+    diagnostics = summarize_batch(batch=batch, seed=3, n_events=len(events))
+
+    assert np.isclose(diagnostics.system_net_force_y, 0.0)
