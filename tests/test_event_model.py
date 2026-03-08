@@ -13,6 +13,7 @@ from float_sim.event_model import (
     evaluate_side_metrics,
     make_parallel_bodies,
     point_in_body,
+    resolve_events_for_source_support,
     run_ensemble,
     sample_body_boundary,
     sample_wave_events,
@@ -228,6 +229,121 @@ def test_body_surface_source_model_is_reproducible() -> None:
     assert np.array_equal(batch_a.events.emitter_indices, batch_b.events.emitter_indices)
     assert np.allclose(batch_a.events.amplitudes, batch_b.events.amplitudes)
     assert np.isclose(batch_a.explicit_mean_gap_closing_force, batch_b.explicit_mean_gap_closing_force)
+
+
+def test_periodic_support_repeats_all_image_tiles() -> None:
+    params = ModelParameters(domain_half_length=2.0, domain_half_width=1.5)
+    source_field = SourceField(model="uniform", support="periodic_rectangle", periodic_image_layers=1)
+    events = WaveEvents(
+        positions=np.array([[0.2, 0.3], [-0.4, -0.6]], dtype=float),
+        amplitudes=np.array([1.0, 2.0], dtype=float),
+        emitter_indices=np.array([-1, -1], dtype=int),
+    )
+
+    resolved = resolve_events_for_source_support(events, params, source_field)
+
+    assert resolved.positions.shape == (18, 2)
+    assert resolved.amplitudes.shape == (18,)
+    assert np.array_equal(resolved.emitter_indices, np.tile(events.emitter_indices, 9))
+
+
+def test_periodic_support_is_invariant_under_whole_tile_translation() -> None:
+    params = ModelParameters(domain_half_length=2.0, domain_half_width=1.5, side_samples=9, attenuation_length=2.0)
+    source_field = SourceField(model="uniform", support="periodic_rectangle", periodic_image_layers=1)
+    base_event = WaveEvents(
+        positions=np.array([[0.1, 1.2]], dtype=float),
+        amplitudes=np.ones(1, dtype=float),
+        emitter_indices=np.array([-1], dtype=int),
+    )
+    translated_event = WaveEvents(
+        positions=np.array([[0.1 + 4.0, 1.2 - 3.0]], dtype=float),
+        amplitudes=np.ones(1, dtype=float),
+        emitter_indices=np.array([-1], dtype=int),
+    )
+
+    batch_a = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(9),
+        n_events=1,
+        blocking_enabled=False,
+        events=base_event,
+        source_field=source_field,
+    )
+    batch_b = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(9),
+        n_events=1,
+        blocking_enabled=False,
+        events=translated_event,
+        source_field=source_field,
+    )
+
+    assert np.isclose(batch_a.mean_gap_closing_force, batch_b.mean_gap_closing_force)
+    assert np.isclose(batch_a.explicit_mean_gap_closing_force, batch_b.explicit_mean_gap_closing_force)
+
+
+def test_periodic_support_rejects_vertical_gradient() -> None:
+    try:
+        SourceField(model="vertical_gradient", support="periodic_rectangle", vertical_bias=0.5)
+    except ValueError as exc:
+        assert "vertical_gradient" in str(exc)
+    else:
+        raise AssertionError("expected vertical_gradient periodic support to be rejected")
+
+
+def test_periodic_support_reduces_domain_size_sensitivity_for_uniform_field() -> None:
+    small = ModelParameters(domain_half_length=4.0, domain_half_width=3.0, attenuation_length=2.5, side_samples=17)
+    large = ModelParameters(domain_half_length=8.0, domain_half_width=6.0, attenuation_length=2.5, side_samples=17)
+    shielding = ShieldingModel.graded(minimum_transmission=0.15, occlusion_decay_length=0.25)
+    finite_field = SourceField()
+    periodic_field = SourceField(support="periodic_rectangle", periodic_image_layers=1)
+
+    finite_small = simulate_batch(
+        gap=0.6,
+        params=small,
+        rng=np.random.default_rng(240),
+        n_events=event_count_from_source_density(1.0, small),
+        source_field=finite_field,
+        shielding_model=shielding,
+    )
+    finite_large = simulate_batch(
+        gap=0.6,
+        params=large,
+        rng=np.random.default_rng(240),
+        n_events=event_count_from_source_density(1.0, large),
+        source_field=finite_field,
+        shielding_model=shielding,
+    )
+    periodic_small = simulate_batch(
+        gap=0.6,
+        params=small,
+        rng=np.random.default_rng(240),
+        n_events=event_count_from_source_density(1.0, small),
+        source_field=periodic_field,
+        shielding_model=shielding,
+    )
+    periodic_large = simulate_batch(
+        gap=0.6,
+        params=large,
+        rng=np.random.default_rng(240),
+        n_events=event_count_from_source_density(1.0, large),
+        source_field=periodic_field,
+        shielding_model=shielding,
+    )
+
+    finite_delta = abs(finite_small.mean_gap_closing_force - finite_large.mean_gap_closing_force)
+    periodic_delta = abs(periodic_small.mean_gap_closing_force - periodic_large.mean_gap_closing_force)
+    finite_explicit_delta = abs(
+        finite_small.explicit_mean_gap_closing_force - finite_large.explicit_mean_gap_closing_force
+    )
+    periodic_explicit_delta = abs(
+        periodic_small.explicit_mean_gap_closing_force - periodic_large.explicit_mean_gap_closing_force
+    )
+
+    assert periodic_delta < finite_delta
+    assert periodic_explicit_delta < finite_explicit_delta
 
 
 def test_boundary_sampling_weights_sum_to_body_perimeter() -> None:

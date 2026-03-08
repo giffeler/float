@@ -7,6 +7,7 @@ import numpy as np
 
 SideName = Literal["outer", "inner"]
 SourceModel = Literal["uniform", "vertical_gradient", "body_surface"]
+SourceSupport = Literal["finite_rectangle", "periodic_rectangle"]
 ShieldingMode = Literal["none", "binary", "graded"]
 
 
@@ -27,8 +28,10 @@ class ModelParameters:
 @dataclass(frozen=True)
 class SourceField:
     model: SourceModel = "uniform"
+    support: SourceSupport = "finite_rectangle"
     vertical_bias: float = 0.0
     emission_offset: float = 0.1
+    periodic_image_layers: int = 1
 
     def __post_init__(self) -> None:
         if abs(self.vertical_bias) > 1.0:
@@ -37,15 +40,28 @@ class SourceField:
             raise ValueError("emission_offset must be positive")
         if self.model not in {"uniform", "vertical_gradient", "body_surface"}:
             raise ValueError(f"unsupported source model: {self.model}")
+        if self.support not in {"finite_rectangle", "periodic_rectangle"}:
+            raise ValueError(f"unsupported source support: {self.support}")
+        if self.periodic_image_layers < 0:
+            raise ValueError("periodic_image_layers must be non-negative")
+        if self.support == "periodic_rectangle" and self.model == "vertical_gradient":
+            raise ValueError("vertical_gradient is not supported with periodic_rectangle support")
 
     @property
     def label(self) -> str:
         if self.model == "body_surface":
             return f"body-surface emission (offset = {self.emission_offset:.2f})"
+        support_label = self.support_label
         if self.model == "uniform" or np.isclose(self.vertical_bias, 0.0):
-            return "uniform"
+            return f"uniform / {support_label}"
         direction = "+y" if self.vertical_bias > 0.0 else "-y"
-        return f"{self.model} ({direction}, |bias|={abs(self.vertical_bias):.2f})"
+        return f"{self.model} ({direction}, |bias|={abs(self.vertical_bias):.2f}) / {support_label}"
+
+    @property
+    def support_label(self) -> str:
+        if self.support == "finite_rectangle":
+            return "finite rectangle"
+        return f"periodic rectangle (layers = {self.periodic_image_layers})"
 
 
 @dataclass(frozen=True)
@@ -193,8 +209,10 @@ class BatchDiagnostics:
     seed: int
     n_events: int
     source_model: SourceModel
+    source_support: SourceSupport
     source_bias: float
     emission_offset: float
+    periodic_image_layers: int
     minimum_transmission: float
     occlusion_decay_length: float
     mean_gap_closing_force: float
@@ -237,8 +255,10 @@ class EnsembleSummary:
     repeats: int
     n_events: int
     source_model: SourceModel
+    source_support: SourceSupport
     source_bias: float
     emission_offset: float
+    periodic_image_layers: int
     minimum_transmission: float
     occlusion_decay_length: float
     mean_gap_closing_force: float
@@ -325,6 +345,10 @@ def source_domain_area(params: ModelParameters) -> float:
     return 4.0 * params.domain_half_length * params.domain_half_width
 
 
+def source_domain_period(params: ModelParameters) -> np.ndarray:
+    return np.array([2.0 * params.domain_half_length, 2.0 * params.domain_half_width], dtype=float)
+
+
 def event_count_from_source_density(source_density: float, params: ModelParameters) -> int:
     if source_density <= 0.0:
         raise ValueError("source_density must be positive")
@@ -389,6 +413,58 @@ def sample_body_boundary(body: Body, side_samples: int) -> BoundarySamples:
         ]
     )
     return BoundarySamples(positions=positions, normals=normals, weights=weights)
+
+
+def wrap_positions_to_source_domain(positions: np.ndarray, params: ModelParameters) -> np.ndarray:
+    periods = source_domain_period(params)
+    lower = np.array([-params.domain_half_length, -params.domain_half_width], dtype=float)
+    wrapped = (positions - lower[None, :]) % periods[None, :] + lower[None, :]
+    wrapped[:, 0] = np.where(np.isclose(wrapped[:, 0], params.domain_half_length), -params.domain_half_length, wrapped[:, 0])
+    wrapped[:, 1] = np.where(np.isclose(wrapped[:, 1], params.domain_half_width), -params.domain_half_width, wrapped[:, 1])
+    return wrapped
+
+
+def source_image_offsets(params: ModelParameters, source_field: SourceField) -> np.ndarray:
+    if source_field.model == "body_surface" or source_field.support == "finite_rectangle":
+        return np.zeros((1, 2), dtype=float)
+
+    period = source_domain_period(params)
+    offsets = [
+        np.array([ix * period[0], iy * period[1]], dtype=float)
+        for ix in range(-source_field.periodic_image_layers, source_field.periodic_image_layers + 1)
+        for iy in range(-source_field.periodic_image_layers, source_field.periodic_image_layers + 1)
+    ]
+    return np.asarray(offsets, dtype=float)
+
+
+def resolve_events_for_source_support(
+    events: WaveEvents,
+    params: ModelParameters,
+    source_field: SourceField,
+) -> WaveEvents:
+    if source_field.model == "body_surface":
+        return events
+
+    base_positions = (
+        wrap_positions_to_source_domain(events.positions, params)
+        if source_field.support == "periodic_rectangle"
+        else np.asarray(events.positions, dtype=float)
+    )
+    offsets = source_image_offsets(params, source_field)
+    if offsets.shape[0] == 1:
+        return WaveEvents(
+            positions=base_positions,
+            amplitudes=np.asarray(events.amplitudes, dtype=float),
+            emitter_indices=None if events.emitter_indices is None else np.asarray(events.emitter_indices, dtype=int),
+        )
+
+    positions = np.vstack([base_positions + offset[None, :] for offset in offsets])
+    amplitudes = np.tile(np.asarray(events.amplitudes, dtype=float), offsets.shape[0])
+    if events.emitter_indices is None:
+        emitter_indices = None
+    else:
+        emitter_indices = np.tile(np.asarray(events.emitter_indices, dtype=int), offsets.shape[0])
+    return WaveEvents(positions=positions, amplitudes=amplitudes, emitter_indices=emitter_indices)
 
 
 def sample_point_on_body_perimeter(
@@ -698,10 +774,11 @@ def simulate_batch(
     active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
     bodies = make_parallel_bodies(gap=gap, params=params)
     sampled_events = events if events is not None else sample_wave_events(rng, n_events, bodies, params, field)
+    resolved_events = resolve_events_for_source_support(sampled_events, params, field)
     upper = compute_body_metrics(
         body=bodies[0],
         blocker=bodies[1],
-        events=sampled_events,
+        events=resolved_events,
         params=params,
         blocking_enabled=active_shielding.mode != "none",
         shielding_model=active_shielding,
@@ -710,7 +787,7 @@ def simulate_batch(
     lower = compute_body_metrics(
         body=bodies[1],
         blocker=bodies[0],
-        events=sampled_events,
+        events=resolved_events,
         params=params,
         blocking_enabled=active_shielding.mode != "none",
         shielding_model=active_shielding,
@@ -752,8 +829,10 @@ def summarize_batch(batch: BatchResult, seed: int, n_events: int) -> BatchDiagno
         seed=seed,
         n_events=n_events,
         source_model=batch.source_field.model,
+        source_support=batch.source_field.support,
         source_bias=batch.source_field.vertical_bias,
         emission_offset=batch.source_field.emission_offset,
+        periodic_image_layers=batch.source_field.periodic_image_layers,
         minimum_transmission=batch.shielding_model.minimum_transmission,
         occlusion_decay_length=batch.shielding_model.occlusion_decay_length,
         mean_gap_closing_force=batch.mean_gap_closing_force,
@@ -837,8 +916,10 @@ def summarize_ensemble(records: Sequence[BatchDiagnostics]) -> EnsembleSummary:
         repeats=repeats,
         n_events=first.n_events,
         source_model=first.source_model,
+        source_support=first.source_support,
         source_bias=first.source_bias,
         emission_offset=first.emission_offset,
+        periodic_image_layers=first.periodic_image_layers,
         minimum_transmission=first.minimum_transmission,
         occlusion_decay_length=first.occlusion_decay_length,
         mean_gap_closing_force=gap_closing_mean,
