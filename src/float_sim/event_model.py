@@ -120,30 +120,71 @@ class Body:
     length: float
     width: float
     outward_sign: int
+    angle: float = 0.0
 
     @property
     def min_x(self) -> float:
-        return self.center_x - 0.5 * self.length
+        return float(self.corners[:, 0].min())
 
     @property
     def max_x(self) -> float:
-        return self.center_x + 0.5 * self.length
+        return float(self.corners[:, 0].max())
 
     @property
     def min_y(self) -> float:
-        return self.center_y - 0.5 * self.width
+        return float(self.corners[:, 1].min())
 
     @property
     def max_y(self) -> float:
-        return self.center_y + 0.5 * self.width
+        return float(self.corners[:, 1].max())
+
+    @property
+    def center(self) -> np.ndarray:
+        return np.array([self.center_x, self.center_y], dtype=float)
+
+    @property
+    def length_axis(self) -> np.ndarray:
+        return np.array([np.cos(self.angle), np.sin(self.angle)], dtype=float)
+
+    @property
+    def width_axis(self) -> np.ndarray:
+        return np.array([-np.sin(self.angle), np.cos(self.angle)], dtype=float)
+
+    @property
+    def rotation_matrix(self) -> np.ndarray:
+        return np.column_stack([self.length_axis, self.width_axis])
+
+    @property
+    def corners(self) -> np.ndarray:
+        local = np.array(
+            [
+                [-0.5 * self.length, -0.5 * self.width],
+                [0.5 * self.length, -0.5 * self.width],
+                [0.5 * self.length, 0.5 * self.width],
+                [-0.5 * self.length, 0.5 * self.width],
+            ],
+            dtype=float,
+        )
+        return self.to_global(local)
+
+    def to_local(self, points: np.ndarray) -> np.ndarray:
+        array = np.atleast_2d(np.asarray(points, dtype=float))
+        return (array - self.center[None, :]) @ self.rotation_matrix
+
+    def to_global(self, local_points: np.ndarray) -> np.ndarray:
+        array = np.atleast_2d(np.asarray(local_points, dtype=float))
+        return self.center[None, :] + array @ self.rotation_matrix.T
 
     def side_y(self, side: SideName) -> float:
+        return float(self.side_center(side)[1])
+
+    def side_center(self, side: SideName) -> np.ndarray:
         sign = self.outward_sign if side == "outer" else -self.outward_sign
-        return self.center_y + sign * 0.5 * self.width
+        return self.center + sign * 0.5 * self.width * self.width_axis
 
     def side_normal(self, side: SideName) -> np.ndarray:
         sign = self.outward_sign if side == "outer" else -self.outward_sign
-        return np.array([0.0, float(sign)])
+        return sign * self.width_axis
 
 
 @dataclass(frozen=True)
@@ -204,6 +245,8 @@ class BatchResult:
 @dataclass(frozen=True)
 class BatchDiagnostics:
     gap: float
+    upper_angle: float
+    lower_angle: float
     blocking_enabled: bool
     shielding_mode: ShieldingMode
     seed: int
@@ -250,6 +293,8 @@ class BatchDiagnostics:
 @dataclass(frozen=True)
 class EnsembleSummary:
     gap: float
+    upper_angle: float
+    lower_angle: float
     blocking_enabled: bool
     shielding_mode: ShieldingMode
     repeats: int
@@ -313,8 +358,13 @@ class TrajectoryPoint:
     mean_gap_closing_force: float
 
 
-def make_parallel_bodies(gap: float, params: ModelParameters) -> tuple[Body, Body]:
-    center_offset = 0.5 * (gap + params.body_width)
+def make_oriented_bodies(
+    gap: float,
+    params: ModelParameters,
+    upper_angle: float = 0.0,
+    lower_angle: float = 0.0,
+) -> tuple[Body, Body]:
+    center_offset = 0.5 * gap + 0.25 * params.body_width * (np.cos(upper_angle) + np.cos(lower_angle))
     upper = Body(
         name="upper",
         center_x=0.0,
@@ -322,6 +372,7 @@ def make_parallel_bodies(gap: float, params: ModelParameters) -> tuple[Body, Bod
         length=params.body_length,
         width=params.body_width,
         outward_sign=1,
+        angle=upper_angle,
     )
     lower = Body(
         name="lower",
@@ -330,14 +381,20 @@ def make_parallel_bodies(gap: float, params: ModelParameters) -> tuple[Body, Bod
         length=params.body_length,
         width=params.body_width,
         outward_sign=-1,
+        angle=lower_angle,
     )
     return upper, lower
 
 
+def make_parallel_bodies(gap: float, params: ModelParameters) -> tuple[Body, Body]:
+    return make_oriented_bodies(gap=gap, params=params)
+
+
 def point_in_body(point: np.ndarray, body: Body, padding: float = 0.0) -> bool:
+    local = body.to_local(np.asarray(point, dtype=float))[0]
     return (
-        (body.min_x - padding) <= point[0] <= (body.max_x + padding)
-        and (body.min_y - padding) <= point[1] <= (body.max_y + padding)
+        abs(local[0]) <= 0.5 * body.length + padding
+        and abs(local[1]) <= 0.5 * body.width + padding
     )
 
 
@@ -364,9 +421,10 @@ def attenuation(distance: np.ndarray, params: ModelParameters) -> np.ndarray:
 
 
 def side_sample_points(body: Body, side: SideName, count: int) -> np.ndarray:
-    x_values = np.linspace(body.min_x, body.max_x, count)
-    y_values = np.full(count, body.side_y(side))
-    return np.column_stack([x_values, y_values])
+    local_x = np.linspace(-0.5 * body.length, 0.5 * body.length, count)
+    sign = body.outward_sign if side == "outer" else -body.outward_sign
+    local_y = np.full(count, sign * 0.5 * body.width)
+    return body.to_global(np.column_stack([local_x, local_y]))
 
 
 def sample_line_segment(start: np.ndarray, end: np.ndarray, count: int) -> np.ndarray:
@@ -382,26 +440,34 @@ def sample_body_boundary(body: Body, side_samples: int) -> BoundarySamples:
 
     endcap_samples = max(1, int(round(side_samples * body.width / max(body.length, 1e-12))))
 
-    top = sample_line_segment(np.array([body.min_x, body.max_y]), np.array([body.max_x, body.max_y]), side_samples)
-    bottom = sample_line_segment(
-        np.array([body.max_x, body.min_y]),
-        np.array([body.min_x, body.min_y]),
+    top_local = sample_line_segment(
+        np.array([-0.5 * body.length, 0.5 * body.width]),
+        np.array([0.5 * body.length, 0.5 * body.width]),
         side_samples,
     )
-    right = sample_line_segment(
-        np.array([body.max_x, body.max_y]),
-        np.array([body.max_x, body.min_y]),
+    bottom_local = sample_line_segment(
+        np.array([0.5 * body.length, -0.5 * body.width]),
+        np.array([-0.5 * body.length, -0.5 * body.width]),
+        side_samples,
+    )
+    right_local = sample_line_segment(
+        np.array([0.5 * body.length, 0.5 * body.width]),
+        np.array([0.5 * body.length, -0.5 * body.width]),
         endcap_samples,
     )
-    left = sample_line_segment(np.array([body.min_x, body.min_y]), np.array([body.min_x, body.max_y]), endcap_samples)
+    left_local = sample_line_segment(
+        np.array([-0.5 * body.length, -0.5 * body.width]),
+        np.array([-0.5 * body.length, 0.5 * body.width]),
+        endcap_samples,
+    )
 
-    positions = np.vstack([top, right, bottom, left])
+    positions = body.to_global(np.vstack([top_local, right_local, bottom_local, left_local]))
     normals = np.vstack(
         [
-            np.tile(np.array([[0.0, 1.0]]), (side_samples, 1)),
-            np.tile(np.array([[1.0, 0.0]]), (endcap_samples, 1)),
-            np.tile(np.array([[0.0, -1.0]]), (side_samples, 1)),
-            np.tile(np.array([[-1.0, 0.0]]), (endcap_samples, 1)),
+            np.tile(body.to_global(np.array([[0.0, 1.0]])) - body.center[None, :], (side_samples, 1)),
+            np.tile(body.to_global(np.array([[1.0, 0.0]])) - body.center[None, :], (endcap_samples, 1)),
+            np.tile(body.to_global(np.array([[0.0, -1.0]])) - body.center[None, :], (side_samples, 1)),
+            np.tile(body.to_global(np.array([[-1.0, 0.0]])) - body.center[None, :], (endcap_samples, 1)),
         ]
     )
     weights = np.concatenate(
@@ -476,34 +542,39 @@ def sample_point_on_body_perimeter(
     draw = rng.uniform(0.0, perimeter)
 
     if draw < body.length:
-        x = body.min_x + draw
-        point = np.array([x, body.max_y])
-        normal = np.array([0.0, 1.0])
+        x = -0.5 * body.length + draw
+        point = np.array([x, 0.5 * body.width], dtype=float)
+        normal = np.array([0.0, 1.0], dtype=float)
     elif draw < body.length + body.width:
-        y = body.max_y - (draw - body.length)
-        point = np.array([body.max_x, y])
-        normal = np.array([1.0, 0.0])
+        y = 0.5 * body.width - (draw - body.length)
+        point = np.array([0.5 * body.length, y], dtype=float)
+        normal = np.array([1.0, 0.0], dtype=float)
     elif draw < 2.0 * body.length + body.width:
-        x = body.max_x - (draw - body.length - body.width)
-        point = np.array([x, body.min_y])
-        normal = np.array([0.0, -1.0])
+        x = 0.5 * body.length - (draw - body.length - body.width)
+        point = np.array([x, -0.5 * body.width], dtype=float)
+        normal = np.array([0.0, -1.0], dtype=float)
     else:
-        y = body.min_y + (draw - 2.0 * body.length - body.width)
-        point = np.array([body.min_x, y])
-        normal = np.array([-1.0, 0.0])
+        y = -0.5 * body.width + (draw - 2.0 * body.length - body.width)
+        point = np.array([-0.5 * body.length, y], dtype=float)
+        normal = np.array([-1.0, 0.0], dtype=float)
 
-    return point + emission_offset * normal
+    return body.to_global((point + emission_offset * normal)[None, :])[0]
 
 
 def segment_intersects_body(start: np.ndarray, end: np.ndarray, body: Body) -> bool:
     return segment_body_overlap_length(start, end, body) > 0.0
 
 
-def segment_body_overlap_length(start: np.ndarray, end: np.ndarray, body: Body) -> float:
+def _segment_box_overlap_length(
+    start: np.ndarray,
+    end: np.ndarray,
+    half_length: float,
+    half_width: float,
+) -> float:
     direction = end - start
     t_min = 0.0
     t_max = 1.0
-    bounds = ((body.min_x, body.max_x), (body.min_y, body.max_y))
+    bounds = ((-half_length, half_length), (-half_width, half_width))
 
     for axis, (lower, upper) in enumerate(bounds):
         delta = direction[axis]
@@ -522,6 +593,12 @@ def segment_body_overlap_length(start: np.ndarray, end: np.ndarray, body: Body) 
             return 0.0
 
     return float(np.linalg.norm(direction) * max(0.0, t_max - t_min))
+
+
+def segment_body_overlap_length(start: np.ndarray, end: np.ndarray, body: Body) -> float:
+    local_start = body.to_local(np.asarray(start, dtype=float))[0]
+    local_end = body.to_local(np.asarray(end, dtype=float))[0]
+    return _segment_box_overlap_length(local_start, local_end, 0.5 * body.length, 0.5 * body.width)
 
 
 def resolve_shielding_model(
@@ -747,7 +824,12 @@ def compute_body_metrics(
         body_emitter_index=body_emitter_index,
     )
     explicit_net_force_y = float(explicit_force_vector[1])
-    explicit_gap_closing_force = float(-body.outward_sign * explicit_net_force_y)
+    if blocker is None:
+        closing_direction = -body.outward_sign * np.array([0.0, 1.0], dtype=float)
+    else:
+        direction = blocker.center - body.center
+        closing_direction = direction / max(np.linalg.norm(direction), 1e-12)
+    explicit_gap_closing_force = float(explicit_force_vector @ closing_direction)
 
     return BodyMetrics(
         inner=inner,
@@ -765,6 +847,7 @@ def simulate_batch(
     params: ModelParameters,
     rng: np.random.Generator,
     n_events: int,
+    orientation_angles: tuple[float, float] = (0.0, 0.0),
     blocking_enabled: bool = True,
     events: WaveEvents | None = None,
     source_field: SourceField | None = None,
@@ -772,7 +855,12 @@ def simulate_batch(
 ) -> BatchResult:
     field = source_field or SourceField()
     active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
-    bodies = make_parallel_bodies(gap=gap, params=params)
+    bodies = make_oriented_bodies(
+        gap=gap,
+        params=params,
+        upper_angle=orientation_angles[0],
+        lower_angle=orientation_angles[1],
+    )
     sampled_events = events if events is not None else sample_wave_events(rng, n_events, bodies, params, field)
     resolved_events = resolve_events_for_source_support(sampled_events, params, field)
     upper = compute_body_metrics(
@@ -824,6 +912,8 @@ def summarize_batch(batch: BatchResult, seed: int, n_events: int) -> BatchDiagno
 
     return BatchDiagnostics(
         gap=batch.gap,
+        upper_angle=batch.bodies[0].angle,
+        lower_angle=batch.bodies[1].angle,
         blocking_enabled=batch.blocking_enabled,
         shielding_mode=batch.shielding_model.mode,
         seed=seed,
@@ -858,6 +948,7 @@ def run_ensemble(
     n_events: int,
     repeats: int,
     seed: int,
+    orientation_angles: tuple[float, float] = (0.0, 0.0),
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
     shielding_model: ShieldingModel | None = None,
@@ -872,6 +963,7 @@ def run_ensemble(
             params=params,
             rng=np.random.default_rng(run_seed),
             n_events=n_events,
+            orientation_angles=orientation_angles,
             blocking_enabled=active_shielding.mode != "none",
             source_field=field,
             shielding_model=active_shielding,
@@ -911,6 +1003,8 @@ def summarize_ensemble(records: Sequence[BatchDiagnostics]) -> EnsembleSummary:
 
     return EnsembleSummary(
         gap=first.gap,
+        upper_angle=first.upper_angle,
+        lower_angle=first.lower_angle,
         blocking_enabled=first.blocking_enabled,
         shielding_mode=first.shielding_mode,
         repeats=repeats,
@@ -954,6 +1048,7 @@ def run_gap_ensemble_sweep(
     n_events: int,
     repeats: int,
     seed: int,
+    orientation_angles: tuple[float, float] = (0.0, 0.0),
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
     shielding_model: ShieldingModel | None = None,
@@ -966,6 +1061,7 @@ def run_gap_ensemble_sweep(
             n_events=n_events,
             repeats=repeats,
             seed=seed,
+            orientation_angles=orientation_angles,
             blocking_enabled=blocking_enabled,
             source_field=source_field,
             shielding_model=shielding_model,
@@ -980,6 +1076,7 @@ def run_distance_sweep(
     n_events: int,
     repeats: int,
     seed: int,
+    orientation_angles: tuple[float, float] = (0.0, 0.0),
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
     shielding_model: ShieldingModel | None = None,
@@ -990,6 +1087,7 @@ def run_distance_sweep(
         n_events=n_events,
         repeats=repeats,
         seed=seed,
+        orientation_angles=orientation_angles,
         blocking_enabled=blocking_enabled,
         source_field=source_field,
         shielding_model=shielding_model,
@@ -1011,6 +1109,7 @@ def simulate_gap_trajectory(
     n_events_per_step: int,
     params: ModelParameters,
     seed: int,
+    orientation_angles: tuple[float, float] = (0.0, 0.0),
     blocking_enabled: bool = True,
     source_field: SourceField | None = None,
     shielding_model: ShieldingModel | None = None,
@@ -1025,6 +1124,7 @@ def simulate_gap_trajectory(
             params=params,
             rng=rng,
             n_events=n_events_per_step,
+            orientation_angles=orientation_angles,
             blocking_enabled=blocking_enabled,
             source_field=source_field,
             shielding_model=shielding_model,
@@ -1049,15 +1149,15 @@ def plot_geometry(ax, batch: BatchResult, max_events: int = 400) -> None:
     ax.scatter(events[:, 0], events[:, 1], s=12, alpha=0.35, c=colors, label="wave events")
 
     for body, facecolor in zip(batch.bodies, ("#1d3557", "#264653"), strict=True):
-        rectangle = plt.Rectangle(
-            (body.min_x, body.min_y),
-            body.length,
-            body.width,
+        polygon = plt.Polygon(
+            body.corners,
             facecolor=facecolor,
             edgecolor="black",
             alpha=0.65,
         )
-        ax.add_patch(rectangle)
+        ax.add_patch(polygon)
+        axis_tip = body.center + 0.6 * body.length_axis
+        ax.plot([body.center_x, axis_tip[0]], [body.center_y, axis_tip[1]], color="black", linewidth=1.2)
 
     ax.axhline(0.0, color="0.65", linestyle="--", linewidth=1.0)
     ax.set_title(

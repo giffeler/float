@@ -11,6 +11,7 @@ from float_sim.event_model import (
     event_count_from_source_density,
     evaluate_explicit_force,
     evaluate_side_metrics,
+    make_oriented_bodies,
     make_parallel_bodies,
     point_in_body,
     resolve_events_for_source_support,
@@ -162,6 +163,35 @@ def test_binary_shielding_model_matches_legacy_boolean_blocking() -> None:
     assert np.isclose(batch_legacy.mean_gap_closing_force, batch_model.mean_gap_closing_force)
     assert np.isclose(batch_legacy.upper.inner.cumulative_impulse, batch_model.upper.inner.cumulative_impulse)
     assert np.isclose(batch_legacy.lower.outer.cumulative_impulse, batch_model.lower.outer.cumulative_impulse)
+
+
+def test_zero_orientation_matches_parallel_geometry() -> None:
+    params = ModelParameters()
+    parallel = make_parallel_bodies(gap=0.8, params=params)
+    oriented = make_oriented_bodies(gap=0.8, params=params, upper_angle=0.0, lower_angle=0.0)
+
+    for parallel_body, oriented_body in zip(parallel, oriented, strict=True):
+        assert np.allclose(parallel_body.corners, oriented_body.corners)
+        assert np.allclose(parallel_body.side_normal("inner"), oriented_body.side_normal("inner"))
+        assert np.allclose(parallel_body.side_normal("outer"), oriented_body.side_normal("outer"))
+
+
+def test_rotated_body_point_membership_uses_local_coordinates() -> None:
+    body = Body(
+        name="rotated",
+        center_x=0.0,
+        center_y=0.0,
+        length=3.0,
+        width=0.4,
+        outward_sign=1,
+        angle=np.deg2rad(30.0),
+    )
+
+    inside = body.to_global(np.array([[0.25, 0.05]], dtype=float))[0]
+    outside = body.to_global(np.array([[0.25, 0.35]], dtype=float))[0]
+
+    assert point_in_body(inside, body)
+    assert not point_in_body(outside, body)
 
 
 def test_body_surface_sources_are_tagged_and_outside_bodies() -> None:
@@ -344,6 +374,34 @@ def test_periodic_support_reduces_domain_size_sensitivity_for_uniform_field() ->
 
     assert periodic_delta < finite_delta
     assert periodic_explicit_delta < finite_explicit_delta
+
+
+def test_zero_orientation_simulation_matches_parallel_results() -> None:
+    params = ModelParameters()
+    source_field = SourceField()
+    shielding = ShieldingModel.graded(minimum_transmission=0.15, occlusion_decay_length=0.25)
+
+    batch_parallel = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(77),
+        n_events=250,
+        source_field=source_field,
+        shielding_model=shielding,
+    )
+    batch_oriented = simulate_batch(
+        gap=0.8,
+        params=params,
+        rng=np.random.default_rng(77),
+        n_events=250,
+        orientation_angles=(0.0, 0.0),
+        source_field=source_field,
+        shielding_model=shielding,
+    )
+
+    assert np.isclose(batch_parallel.mean_gap_closing_force, batch_oriented.mean_gap_closing_force)
+    assert np.isclose(batch_parallel.explicit_mean_gap_closing_force, batch_oriented.explicit_mean_gap_closing_force)
+    assert np.allclose(batch_parallel.events.positions, batch_oriented.events.positions)
 
 
 def test_boundary_sampling_weights_sum_to_body_perimeter() -> None:
