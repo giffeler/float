@@ -6,7 +6,7 @@ from typing import Literal, Sequence
 import numpy as np
 
 SideName = Literal["outer", "inner"]
-SourceModel = Literal["uniform", "vertical_gradient", "body_surface"]
+SourceModel = Literal["uniform", "vertical_gradient", "body_surface", "outside_preferred"]
 SourceSupport = Literal["finite_rectangle", "periodic_rectangle"]
 ShieldingMode = Literal["none", "binary", "graded"]
 
@@ -19,6 +19,8 @@ class ModelParameters:
     domain_half_width: float = 4.0
     attenuation_length: float = 2.5
     attenuation_power: float = 0.0
+    characteristic_wavelength: float = 4.0
+    wavelength_jitter: float = 0.0
     mean_wave_amplitude: float = 1.0
     side_samples: int = 21
     mobility: float = 0.03
@@ -30,15 +32,18 @@ class SourceField:
     model: SourceModel = "uniform"
     support: SourceSupport = "finite_rectangle"
     vertical_bias: float = 0.0
+    outside_bias: float = 0.0
     emission_offset: float = 0.1
     periodic_image_layers: int = 1
 
     def __post_init__(self) -> None:
         if abs(self.vertical_bias) > 1.0:
             raise ValueError("vertical_bias must lie in [-1, 1]")
+        if not 0.0 <= self.outside_bias <= 1.0:
+            raise ValueError("outside_bias must lie in [0, 1]")
         if self.emission_offset <= 0.0:
             raise ValueError("emission_offset must be positive")
-        if self.model not in {"uniform", "vertical_gradient", "body_surface"}:
+        if self.model not in {"uniform", "vertical_gradient", "body_surface", "outside_preferred"}:
             raise ValueError(f"unsupported source model: {self.model}")
         if self.support not in {"finite_rectangle", "periodic_rectangle"}:
             raise ValueError(f"unsupported source support: {self.support}")
@@ -52,6 +57,8 @@ class SourceField:
         if self.model == "body_surface":
             return f"body-surface emission (offset = {self.emission_offset:.2f})"
         support_label = self.support_label
+        if self.model == "outside_preferred":
+            return f"outside-preferred (bias = {self.outside_bias:.2f}) / {support_label}"
         if self.model == "uniform" or np.isclose(self.vertical_bias, 0.0):
             return f"uniform / {support_label}"
         direction = "+y" if self.vertical_bias > 0.0 else "-y"
@@ -191,6 +198,7 @@ class Body:
 class WaveEvents:
     positions: np.ndarray
     amplitudes: np.ndarray
+    wavelengths: np.ndarray | None = None
     emitter_indices: np.ndarray | None = None
 
     def __len__(self) -> int:
@@ -205,9 +213,35 @@ class BoundarySamples:
 
 
 @dataclass(frozen=True)
+class SideInteractionField:
+    positions: np.ndarray
+    normal: np.ndarray
+    distances: np.ndarray
+    incidence_cosine: np.ndarray
+    propagation_strength: np.ndarray
+    transmission: np.ndarray
+    local_impulse: np.ndarray
+
+
+@dataclass(frozen=True)
 class SideMetrics:
     hits: int
     cumulative_impulse: float
+
+
+@dataclass(frozen=True)
+class AngleHistogram:
+    bin_edges: np.ndarray
+    counts: np.ndarray
+    weighted_impulse: np.ndarray
+
+
+@dataclass(frozen=True)
+class SourceContributionMap:
+    x_edges: np.ndarray
+    y_edges: np.ndarray
+    values: np.ndarray
+    quantity: str
 
 
 @dataclass(frozen=True)
@@ -329,6 +363,10 @@ class EnsembleSummary:
     std_inner_impulse: float
     mean_outer_impulse: float
     std_outer_impulse: float
+    std_hit_imbalance: float
+    sem_hit_imbalance: float
+    std_impulse_imbalance: float
+    sem_impulse_imbalance: float
 
     @property
     def hit_imbalance(self) -> float:
@@ -356,6 +394,17 @@ class TrajectoryPoint:
     step: int
     gap: float
     mean_gap_closing_force: float
+
+
+@dataclass(frozen=True)
+class TrajectoryEnsemblePoint:
+    step: int
+    mean_gap: float
+    std_gap: float
+    sem_gap: float
+    mean_gap_closing_force: float
+    std_gap_closing_force: float
+    sem_gap_closing_force: float
 
 
 def make_oriented_bodies(
@@ -418,6 +467,31 @@ def attenuation(distance: np.ndarray, params: ModelParameters) -> np.ndarray:
     if params.attenuation_power <= 0.0:
         return envelope
     return envelope / np.power(safe_distance, params.attenuation_power)
+
+
+def event_wavelengths(events: WaveEvents, params: ModelParameters) -> np.ndarray:
+    if events.wavelengths is None:
+        return np.full(len(events), params.characteristic_wavelength, dtype=float)
+    return np.asarray(events.wavelengths, dtype=float)
+
+
+def wavelength_envelope(distance: np.ndarray, wavelengths: np.ndarray) -> np.ndarray:
+    safe_wavelengths = np.maximum(np.asarray(wavelengths, dtype=float)[:, None], 1e-9)
+    scaled_distance = distance / safe_wavelengths
+    # Reduced radial packet envelope: longer wavelengths retain more weight at the same distance.
+    return 1.0 / (1.0 + scaled_distance * scaled_distance)
+
+
+def propagation_strength(
+    events: WaveEvents,
+    distance: np.ndarray,
+    params: ModelParameters,
+) -> np.ndarray:
+    return (
+        np.asarray(events.amplitudes, dtype=float)[:, None]
+        * attenuation(distance, params)
+        * wavelength_envelope(distance, event_wavelengths(events, params))
+    )
 
 
 def side_sample_points(body: Body, side: SideName, count: int) -> np.ndarray:
@@ -521,16 +595,23 @@ def resolve_events_for_source_support(
         return WaveEvents(
             positions=base_positions,
             amplitudes=np.asarray(events.amplitudes, dtype=float),
+            wavelengths=None if events.wavelengths is None else np.asarray(events.wavelengths, dtype=float),
             emitter_indices=None if events.emitter_indices is None else np.asarray(events.emitter_indices, dtype=int),
         )
 
     positions = np.vstack([base_positions + offset[None, :] for offset in offsets])
     amplitudes = np.tile(np.asarray(events.amplitudes, dtype=float), offsets.shape[0])
+    wavelengths = None if events.wavelengths is None else np.tile(np.asarray(events.wavelengths, dtype=float), offsets.shape[0])
     if events.emitter_indices is None:
         emitter_indices = None
     else:
         emitter_indices = np.tile(np.asarray(events.emitter_indices, dtype=int), offsets.shape[0])
-    return WaveEvents(positions=positions, amplitudes=amplitudes, emitter_indices=emitter_indices)
+    return WaveEvents(
+        positions=positions,
+        amplitudes=amplitudes,
+        wavelengths=wavelengths,
+        emitter_indices=emitter_indices,
+    )
 
 
 def sample_point_on_body_perimeter(
@@ -633,6 +714,56 @@ def shielding_transmission(
     )
 
 
+def evaluate_side_field(
+    body: Body,
+    side: SideName,
+    events: WaveEvents,
+    params: ModelParameters,
+    blocker: Body | None,
+    blocking_enabled: bool,
+    shielding_model: ShieldingModel | None = None,
+    body_emitter_index: int | None = None,
+) -> SideInteractionField:
+    active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
+    points = side_sample_points(body, side, params.side_samples)
+    normal = body.side_normal(side)
+    vectors = points[None, :, :] - events.positions[:, None, :]
+    distances = np.linalg.norm(vectors, axis=2)
+    unit_vectors = vectors / np.maximum(distances[:, :, None], 1e-12)
+    propagation = propagation_strength(events, distances, params)
+    incidence = np.maximum(-np.einsum("epd,d->ep", unit_vectors, normal), 0.0)
+
+    if body_emitter_index is not None and events.emitter_indices is not None:
+        self_emitted = events.emitter_indices == body_emitter_index
+        propagation = np.where(self_emitted[:, None], 0.0, propagation)
+
+    if active_shielding.mode != "none" and blocker is not None:
+        transmission = np.array(
+            [
+                [shielding_transmission(source, point, blocker, active_shielding) for point in points]
+                for source in events.positions
+            ],
+            dtype=float,
+        )
+    else:
+        transmission = np.ones_like(propagation)
+
+    local_impulse = transmission * propagation * incidence
+    return SideInteractionField(
+        positions=points,
+        normal=normal,
+        distances=distances,
+        incidence_cosine=incidence,
+        propagation_strength=propagation,
+        transmission=transmission,
+        local_impulse=local_impulse,
+    )
+
+
+def event_side_impulses(side_field: SideInteractionField) -> np.ndarray:
+    return side_field.local_impulse.mean(axis=1)
+
+
 def same_force_sign(left: float, right: float, tolerance: float = 1e-9) -> bool:
     if abs(left) <= tolerance and abs(right) <= tolerance:
         return True
@@ -649,6 +780,13 @@ def sample_wave_events(
     source_field: SourceField | None = None,
 ) -> WaveEvents:
     field = source_field or SourceField()
+    if params.wavelength_jitter > 0.0:
+        sampled_wavelengths = np.maximum(
+            1e-6,
+            rng.normal(params.characteristic_wavelength, params.wavelength_jitter, size=count),
+        )
+    else:
+        sampled_wavelengths = np.full(count, params.characteristic_wavelength, dtype=float)
 
     if field.model == "body_surface":
         perimeters = np.array([2.0 * (body.length + body.width) for body in bodies], dtype=float)
@@ -665,11 +803,17 @@ def sample_wave_events(
         return WaveEvents(
             positions=positions,
             amplitudes=amplitudes,
+            wavelengths=sampled_wavelengths,
             emitter_indices=np.asarray(emitter_indices, dtype=int),
         )
 
     accepted: list[np.ndarray] = []
-    max_weight = 1.0 if field.model == "uniform" else 1.0 + abs(field.vertical_bias)
+    if field.model == "uniform":
+        max_weight = 1.0
+    elif field.model == "outside_preferred":
+        max_weight = 1.0 + field.outside_bias
+    else:
+        max_weight = 1.0 + abs(field.vertical_bias)
 
     while len(accepted) < count:
         draw_count = max(count - len(accepted), params.side_samples)
@@ -677,8 +821,14 @@ def sample_wave_events(
         y_values = rng.uniform(-params.domain_half_width, params.domain_half_width, size=draw_count)
         candidates = np.column_stack([x_values, y_values])
 
-        if field.model == "uniform" or np.isclose(field.vertical_bias, 0.0):
+        if field.model == "uniform" or (
+            field.model == "vertical_gradient" and np.isclose(field.vertical_bias, 0.0)
+        ):
             accepted_mask = np.ones(draw_count, dtype=bool)
+        elif field.model == "outside_preferred":
+            normalized_radius = np.abs(candidates[:, 1]) / max(params.domain_half_width, 1e-12)
+            weights = 1.0 + field.outside_bias * normalized_radius
+            accepted_mask = rng.random(draw_count) <= (weights / max_weight)
         else:
             normalized_y = candidates[:, 1] / max(params.domain_half_width, 1e-12)
             weights = 1.0 + field.vertical_bias * normalized_y
@@ -699,6 +849,7 @@ def sample_wave_events(
     return WaveEvents(
         positions=positions,
         amplitudes=amplitudes,
+        wavelengths=sampled_wavelengths,
         emitter_indices=np.full(count, -1, dtype=int),
     )
 
@@ -713,30 +864,17 @@ def evaluate_side_metrics(
     shielding_model: ShieldingModel | None = None,
     body_emitter_index: int | None = None,
 ) -> SideMetrics:
-    active_shielding = resolve_shielding_model(blocking_enabled, shielding_model)
-    points = side_sample_points(body, side, params.side_samples)
-    normal = body.side_normal(side)
-    vectors = points[None, :, :] - events.positions[:, None, :]
-    distances = np.linalg.norm(vectors, axis=2)
-    unit_vectors = vectors / np.maximum(distances[:, :, None], 1e-12)
-    incident = -np.einsum("epd,d->ep", unit_vectors, normal)
-    local_impulse = events.amplitudes[:, None] * attenuation(distances, params) * np.maximum(incident, 0.0)
-
-    if body_emitter_index is not None and events.emitter_indices is not None:
-        self_emitted = events.emitter_indices == body_emitter_index
-        local_impulse = np.where(self_emitted[:, None], 0.0, local_impulse)
-
-    if active_shielding.mode != "none" and blocker is not None:
-        transmission = np.array(
-            [
-                [shielding_transmission(source, point, blocker, active_shielding) for point in points]
-                for source in events.positions
-            ],
-            dtype=float,
-        )
-        local_impulse = transmission * local_impulse
-
-    event_impulse = local_impulse.mean(axis=1)
+    side_field = evaluate_side_field(
+        body=body,
+        side=side,
+        events=events,
+        params=params,
+        blocker=blocker,
+        blocking_enabled=blocking_enabled,
+        shielding_model=shielding_model,
+        body_emitter_index=body_emitter_index,
+    )
+    event_impulse = event_side_impulses(side_field)
     positive = event_impulse > 0.0
     return SideMetrics(hits=int(np.count_nonzero(positive)), cumulative_impulse=float(event_impulse[positive].sum()))
 
@@ -756,7 +894,7 @@ def evaluate_explicit_force(
     distances = np.linalg.norm(vectors, axis=2)
     unit_vectors = vectors / np.maximum(distances[:, :, None], 1e-12)
     incident = -np.einsum("epd,pd->ep", unit_vectors, boundary.normals)
-    local_pressure = events.amplitudes[:, None] * attenuation(distances, params) * np.maximum(incident, 0.0)
+    local_pressure = propagation_strength(events, distances, params) * np.maximum(incident, 0.0)
 
     if body_emitter_index is not None and events.emitter_indices is not None:
         self_emitted = events.emitter_indices == body_emitter_index
@@ -997,6 +1135,8 @@ def summarize_ensemble(records: Sequence[BatchDiagnostics]) -> EnsembleSummary:
     outer_hits_mean, outer_hits_std = _mean_std([record.mean_outer_hits for record in records])
     inner_impulse_mean, inner_impulse_std = _mean_std([record.mean_inner_impulse for record in records])
     outer_impulse_mean, outer_impulse_std = _mean_std([record.mean_outer_impulse for record in records])
+    _, hit_imbalance_std = _mean_std([record.hit_imbalance for record in records])
+    _, impulse_imbalance_std = _mean_std([record.impulse_imbalance for record in records])
     sem = gap_closing_std / np.sqrt(repeats)
     explicit_sem = explicit_gap_closing_std / np.sqrt(repeats)
     sign_agreement_rate = float(np.mean([record.force_law_sign_agreement for record in records]))
@@ -1039,6 +1179,10 @@ def summarize_ensemble(records: Sequence[BatchDiagnostics]) -> EnsembleSummary:
         std_inner_impulse=inner_impulse_std,
         mean_outer_impulse=outer_impulse_mean,
         std_outer_impulse=outer_impulse_std,
+        std_hit_imbalance=hit_imbalance_std,
+        sem_hit_imbalance=float(hit_imbalance_std / np.sqrt(repeats)),
+        std_impulse_imbalance=impulse_imbalance_std,
+        sem_impulse_imbalance=float(impulse_imbalance_std / np.sqrt(repeats)),
     )
 
 
@@ -1141,6 +1285,184 @@ def simulate_gap_trajectory(
     return trajectory
 
 
+def simulate_gap_trajectory_ensemble(
+    initial_gap: float,
+    steps: int,
+    n_events_per_step: int,
+    params: ModelParameters,
+    repeats: int,
+    seed: int,
+    orientation_angles: tuple[float, float] = (0.0, 0.0),
+    blocking_enabled: bool = True,
+    source_field: SourceField | None = None,
+    shielding_model: ShieldingModel | None = None,
+) -> list[TrajectoryEnsemblePoint]:
+    trajectories = [
+        simulate_gap_trajectory(
+            initial_gap=initial_gap,
+            steps=steps,
+            n_events_per_step=n_events_per_step,
+            params=params,
+            seed=seed + repeat,
+            orientation_angles=orientation_angles,
+            blocking_enabled=blocking_enabled,
+            source_field=source_field,
+            shielding_model=shielding_model,
+        )
+        for repeat in range(repeats)
+    ]
+
+    summary: list[TrajectoryEnsemblePoint] = []
+    for step in range(steps + 1):
+        gaps = np.array([trajectory[step].gap for trajectory in trajectories], dtype=float)
+        forces = np.array([trajectory[step].mean_gap_closing_force for trajectory in trajectories], dtype=float)
+        gap_mean, gap_std = _mean_std(gaps)
+        force_mean, force_std = _mean_std(forces)
+        summary.append(
+            TrajectoryEnsemblePoint(
+                step=step,
+                mean_gap=gap_mean,
+                std_gap=gap_std,
+                sem_gap=float(gap_std / np.sqrt(max(repeats, 1))),
+                mean_gap_closing_force=force_mean,
+                std_gap_closing_force=force_std,
+                sem_gap_closing_force=float(force_std / np.sqrt(max(repeats, 1))),
+            )
+        )
+    return summary
+
+
+def batch_side_angle_histogram(
+    batch: BatchResult,
+    params: ModelParameters,
+    side: SideName,
+    bins: int = 18,
+) -> AngleHistogram:
+    bodies = batch.bodies
+    events = resolve_events_for_source_support(batch.events, params, batch.source_field)
+    fields = [
+        evaluate_side_field(
+            body=body,
+            side=side,
+            events=events,
+            params=params,
+            blocker=blocker,
+            blocking_enabled=batch.blocking_enabled,
+            shielding_model=batch.shielding_model,
+            body_emitter_index=index,
+        )
+        for index, (body, blocker) in enumerate(((bodies[0], bodies[1]), (bodies[1], bodies[0])))
+    ]
+
+    all_angles: list[np.ndarray] = []
+    all_weights: list[np.ndarray] = []
+    for field in fields:
+        mask = field.local_impulse > 0.0
+        if not np.any(mask):
+            continue
+        angles = np.degrees(np.arccos(np.clip(field.incidence_cosine[mask], 0.0, 1.0)))
+        all_angles.append(angles)
+        all_weights.append(field.local_impulse[mask])
+
+    bin_edges = np.linspace(0.0, 90.0, bins + 1)
+    if not all_angles:
+        return AngleHistogram(
+            bin_edges=bin_edges,
+            counts=np.zeros(bins, dtype=float),
+            weighted_impulse=np.zeros(bins, dtype=float),
+        )
+
+    merged_angles = np.concatenate(all_angles)
+    merged_weights = np.concatenate(all_weights)
+    counts, _ = np.histogram(merged_angles, bins=bin_edges)
+    weighted_impulse, _ = np.histogram(merged_angles, bins=bin_edges, weights=merged_weights)
+    return AngleHistogram(
+        bin_edges=bin_edges,
+        counts=counts.astype(float),
+        weighted_impulse=weighted_impulse.astype(float),
+    )
+
+
+def batch_source_contribution_map(
+    batch: BatchResult,
+    params: ModelParameters,
+    quantity: Literal["inner_impulse", "outer_impulse", "delta_impulse", "gap_closing_force"] = "delta_impulse",
+    bins: tuple[int, int] = (30, 24),
+) -> SourceContributionMap:
+    events = resolve_events_for_source_support(batch.events, params, batch.source_field)
+    upper_body, lower_body = batch.bodies
+    upper_inner = event_side_impulses(
+        evaluate_side_field(
+            upper_body,
+            "inner",
+            events,
+            params,
+            lower_body,
+            batch.blocking_enabled,
+            shielding_model=batch.shielding_model,
+            body_emitter_index=0,
+        )
+    )
+    upper_outer = event_side_impulses(
+        evaluate_side_field(
+            upper_body,
+            "outer",
+            events,
+            params,
+            lower_body,
+            batch.blocking_enabled,
+            shielding_model=batch.shielding_model,
+            body_emitter_index=0,
+        )
+    )
+    lower_inner = event_side_impulses(
+        evaluate_side_field(
+            lower_body,
+            "inner",
+            events,
+            params,
+            upper_body,
+            batch.blocking_enabled,
+            shielding_model=batch.shielding_model,
+            body_emitter_index=1,
+        )
+    )
+    lower_outer = event_side_impulses(
+        evaluate_side_field(
+            lower_body,
+            "outer",
+            events,
+            params,
+            upper_body,
+            batch.blocking_enabled,
+            shielding_model=batch.shielding_model,
+            body_emitter_index=1,
+        )
+    )
+
+    if quantity == "inner_impulse":
+        weights = 0.5 * (upper_inner + lower_inner)
+    elif quantity == "outer_impulse":
+        weights = 0.5 * (upper_outer + lower_outer)
+    elif quantity == "gap_closing_force":
+        weights = 0.5 * ((upper_outer - upper_inner) + (lower_outer - lower_inner))
+    else:
+        weights = 0.5 * ((upper_outer + lower_outer) - (upper_inner + lower_inner))
+
+    grid, x_edges, y_edges = np.histogram2d(
+        events.positions[:, 0],
+        events.positions[:, 1],
+        bins=bins,
+        weights=weights,
+    )
+    return SourceContributionMap(
+        x_edges=x_edges,
+        y_edges=y_edges,
+        values=grid.T,
+        quantity=quantity,
+    )
+
+
 def plot_geometry(ax, batch: BatchResult, max_events: int = 400) -> None:
     import matplotlib.pyplot as plt  # noqa: F401
 
@@ -1220,6 +1542,8 @@ def plot_ensemble_metric(
         "gap_closing_force",
         "explicit_gap_closing_force",
         "force_law_gap_difference",
+        "hit_imbalance",
+        "impulse_imbalance",
         "system_net_force",
         "explicit_system_net_force",
         "mean_abs_net_force",
@@ -1247,6 +1571,16 @@ def plot_ensemble_metric(
         stds = np.zeros_like(means)
         sems = np.zeros_like(means)
         ylabel = "Explicit minus bookkeeping force"
+    elif metric == "hit_imbalance":
+        means = np.array([summary.hit_imbalance for summary in summaries], dtype=float)
+        stds = np.array([summary.std_hit_imbalance for summary in summaries], dtype=float)
+        sems = np.array([summary.sem_hit_imbalance for summary in summaries], dtype=float)
+        ylabel = "Outer minus inner hit count"
+    elif metric == "impulse_imbalance":
+        means = np.array([summary.impulse_imbalance for summary in summaries], dtype=float)
+        stds = np.array([summary.std_impulse_imbalance for summary in summaries], dtype=float)
+        sems = np.array([summary.sem_impulse_imbalance for summary in summaries], dtype=float)
+        ylabel = "Delta I(d) = I_outer - I_inner"
     elif metric == "system_net_force":
         means = np.array([summary.mean_system_net_force_y for summary in summaries], dtype=float)
         stds = np.array([summary.std_system_net_force_y for summary in summaries], dtype=float)
@@ -1322,3 +1656,44 @@ def plot_gap_trajectory(ax, trajectory: Sequence[TrajectoryPoint], label: str, c
     ax.set_ylabel("Edge-to-edge gap")
     ax.set_title("Gap evolution under repeated Monte Carlo forcing")
     ax.legend(loc="best")
+
+
+def plot_gap_trajectory_ensemble(
+    ax,
+    trajectory: Sequence[TrajectoryEnsemblePoint],
+    label: str,
+    color: str,
+    uncertainty: Literal["std", "sem"] = "sem",
+) -> None:
+    steps = np.array([point.step for point in trajectory], dtype=float)
+    means = np.array([point.mean_gap for point in trajectory], dtype=float)
+    spreads = np.array(
+        [point.sem_gap if uncertainty == "sem" else point.std_gap for point in trajectory],
+        dtype=float,
+    )
+    ax.plot(steps, means, marker="o", color=color, label=label)
+    ax.fill_between(steps, means - spreads, means + spreads, color=color, alpha=0.15)
+    ax.set_xlabel("Update step")
+    ax.set_ylabel("Edge-to-edge gap")
+    ax.set_title("Ensemble gap evolution")
+    ax.legend(loc="best")
+
+
+def plot_contribution_map(ax, contribution_map: SourceContributionMap, cmap: str = "coolwarm") -> None:
+    extent = [
+        float(contribution_map.x_edges[0]),
+        float(contribution_map.x_edges[-1]),
+        float(contribution_map.y_edges[0]),
+        float(contribution_map.y_edges[-1]),
+    ]
+    image = ax.imshow(
+        contribution_map.values,
+        origin="lower",
+        extent=extent,
+        aspect="auto",
+        cmap=cmap,
+    )
+    ax.set_xlabel("x position")
+    ax.set_ylabel("y position")
+    ax.set_title(f"Source contribution map: {contribution_map.quantity}")
+    return image

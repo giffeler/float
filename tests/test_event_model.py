@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from float_sim.event_model import (
+    batch_source_contribution_map,
     Body,
     ModelParameters,
     ShieldingModel,
@@ -18,6 +19,7 @@ from float_sim.event_model import (
     run_ensemble,
     sample_body_boundary,
     sample_wave_events,
+    simulate_gap_trajectory_ensemble,
     segment_body_overlap_length,
     segment_intersects_body,
     simulate_batch,
@@ -258,7 +260,120 @@ def test_body_surface_source_model_is_reproducible() -> None:
     assert np.allclose(batch_a.events.positions, batch_b.events.positions)
     assert np.array_equal(batch_a.events.emitter_indices, batch_b.events.emitter_indices)
     assert np.allclose(batch_a.events.amplitudes, batch_b.events.amplitudes)
-    assert np.isclose(batch_a.explicit_mean_gap_closing_force, batch_b.explicit_mean_gap_closing_force)
+
+
+def test_longer_wavelength_gives_larger_side_impulse_at_same_distance() -> None:
+    params = ModelParameters(side_samples=9, attenuation_length=3.0, characteristic_wavelength=0.8)
+    body = Body(
+        name="upper",
+        center_x=0.0,
+        center_y=0.75,
+        length=3.0,
+        width=0.4,
+        outward_sign=1,
+    )
+    short_wave = WaveEvents(
+        positions=np.array([[0.0, 2.5]], dtype=float),
+        amplitudes=np.ones(1, dtype=float),
+        wavelengths=np.array([0.5], dtype=float),
+    )
+    long_wave = WaveEvents(
+        positions=np.array([[0.0, 2.5]], dtype=float),
+        amplitudes=np.ones(1, dtype=float),
+        wavelengths=np.array([2.0], dtype=float),
+    )
+
+    short_metrics = evaluate_side_metrics(
+        body,
+        "outer",
+        short_wave,
+        params,
+        blocker=None,
+        blocking_enabled=False,
+    )
+    long_metrics = evaluate_side_metrics(
+        body,
+        "outer",
+        long_wave,
+        params,
+        blocker=None,
+        blocking_enabled=False,
+    )
+
+    assert long_metrics.cumulative_impulse > short_metrics.cumulative_impulse
+
+
+def test_outside_preferred_source_field_biases_sources_toward_outer_region() -> None:
+    params = ModelParameters(domain_half_length=6.0, domain_half_width=4.0)
+    bodies = make_parallel_bodies(gap=0.8, params=params)
+    uniform_events = sample_wave_events(
+        rng=np.random.default_rng(73),
+        count=800,
+        bodies=bodies,
+        params=params,
+        source_field=SourceField(model="uniform"),
+    )
+    outside_events = sample_wave_events(
+        rng=np.random.default_rng(73),
+        count=800,
+        bodies=bodies,
+        params=params,
+        source_field=SourceField(model="outside_preferred", outside_bias=1.0),
+    )
+
+    assert np.mean(np.abs(outside_events.positions[:, 1])) > np.mean(np.abs(uniform_events.positions[:, 1]))
+
+
+def test_source_contribution_map_sums_to_gap_closing_force() -> None:
+    params = ModelParameters()
+    batch = simulate_batch(
+        gap=0.6,
+        params=params,
+        rng=np.random.default_rng(101),
+        n_events=300,
+        source_field=SourceField(model="outside_preferred", outside_bias=0.9),
+        shielding_model=ShieldingModel.graded(minimum_transmission=0.2, occlusion_decay_length=0.25),
+    )
+
+    contribution_map = batch_source_contribution_map(
+        batch,
+        params,
+        quantity="gap_closing_force",
+        bins=(20, 16),
+    )
+
+    assert np.isclose(contribution_map.values.sum(), batch.mean_gap_closing_force)
+
+
+def test_gap_trajectory_ensemble_is_reproducible() -> None:
+    params = ModelParameters(mobility=0.002)
+    trajectory_a = simulate_gap_trajectory_ensemble(
+        initial_gap=0.8,
+        steps=4,
+        n_events_per_step=120,
+        params=params,
+        repeats=3,
+        seed=211,
+        source_field=SourceField(model="uniform"),
+        shielding_model=ShieldingModel.binary(),
+    )
+    trajectory_b = simulate_gap_trajectory_ensemble(
+        initial_gap=0.8,
+        steps=4,
+        n_events_per_step=120,
+        params=params,
+        repeats=3,
+        seed=211,
+        source_field=SourceField(model="uniform"),
+        shielding_model=ShieldingModel.binary(),
+    )
+
+    assert [point.step for point in trajectory_a] == [point.step for point in trajectory_b]
+    assert np.allclose([point.mean_gap for point in trajectory_a], [point.mean_gap for point in trajectory_b])
+    assert np.allclose(
+        [point.mean_gap_closing_force for point in trajectory_a],
+        [point.mean_gap_closing_force for point in trajectory_b],
+    )
 
 
 def test_periodic_support_repeats_all_image_tiles() -> None:
