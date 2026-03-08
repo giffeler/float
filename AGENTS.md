@@ -97,7 +97,6 @@ When implementing:
 - Prefer simple helper modules over oversized notebooks.
 - Keep the notebook readable and explanatory.
 - Use deterministic seeds where possible.
-- Add lightweight tests for nontrivial geometry or force-calculation logic.
 
 After implementing:
 - Summarize what changed.
@@ -149,16 +148,26 @@ Performance matters only after correctness and interpretability.
 
 ---
 
-## Validation expectations
+## Python testing (pytest)
 
-Where appropriate, add checks for:
-- symmetry sanity checks
-- no-force expectation in balanced configurations
-- monotonicity expectations for simple attenuation rules
-- reproducibility under fixed random seeds
+Do not write smoke tests as a substitute for real tests.
 
-A simulation that produces attraction everywhere and always is suspicious.
-A useful simulation must be able to produce null results or contradictory results.
+- Write tests that fail for incorrect behavior, fragile assumptions, regressions, and unsafe handling.
+- Prefer edge cases, adversarial inputs, and boundaries over happy paths.
+- Assert exact behavior, invariants, error contracts, and state transitions.
+- Test malformed, missing, duplicated, oversized, and unexpected input.
+- Use pytest.parametrize for boundary matrices.
+- Use pytest.raises for precise failure semantics.
+- Add regression tests for discovered bugs.
+- Use Hypothesis only for meaningful invariants and properties.
+- Test repeated calls, idempotency, mutation, stale state, and ordering dependence where relevant.
+- Test security-relevant abuse cases where applicable.
+- Mock only external boundaries, not internal logic.
+- State for each nontrivial test what it is intended to catch.
+
+A test that only proves “no exception was raised” is insufficient.
+
+If the code is hard to test, name the design limitation explicitly.
 
 ---
 
